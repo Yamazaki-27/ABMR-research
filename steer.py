@@ -22,7 +22,7 @@ from geometry_msgs.msg import Twist
 #
 # value1 < value2 のとき: ANGULAR_SPEED と同じ向き
 # value1 > value2 のとき: ANGULAR_SPEED と逆向き
-ANGULAR_SPEED = 0.30
+ANGULAR_SPEED = -0.30
 
 # 目標値に対する偏差の許容値
 # 例: 3なら、value1とvalue2の差が3以内なら停止
