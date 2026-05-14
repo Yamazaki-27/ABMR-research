@@ -30,12 +30,16 @@ ALLOWABLE_ERROR = 3
 
 # この範囲外の値では旋回させない
 # value1またはvalue2がこの範囲外なら安全のため停止
-ROTATE_VALUE_MIN = 20
-ROTATE_VALUE_MAX = 200
+ROTATE_VALUE_MIN = 14
+ROTATE_VALUE_MAX = 242
 
 # cmd_velを出す周期
 # 0.1～1.0秒程度で調整
-CMD_INTERVAL_SEC = 1.0
+CMD_INTERVAL_SEC = 0.5
+
+# 旋回指令を出している時間
+# 例: 0.02秒なら、20msecだけ旋回指令を出してすぐ停止する
+ROTATE_PULSE_SEC = 0.1
 
 # ローパスフィルタ係数
 # 小さいほど値の変化がゆっくりになる
@@ -130,6 +134,27 @@ def make_stop_twist():
     msg.angular.z = 0.0
     return msg
 
+def publish_rotate_pulse(cmd_angular):
+    """
+    短時間だけ旋回指令を出し、その後すぐ停止する
+    """
+
+    global last_cmd_angular
+
+    msg = Twist()
+    msg.linear.x = 0.0
+    msg.linear.y = 0.0
+    msg.linear.z = 0.0
+    msg.angular.x = 0.0
+    msg.angular.y = 0.0
+    msg.angular.z = cmd_angular
+
+    ros_publisher_cmd_vel.publish(msg)
+    last_cmd_angular = cmd_angular
+
+    rospy.sleep(ROTATE_PULSE_SEC)
+
+    publish_stop()
 
 def publish_stop():
     global last_cmd_angular
@@ -270,16 +295,17 @@ def cmd_vel_timer_callback(event):
         if ANGULAR_SPEED < 0:
             cmd_angular = -cmd_angular
 
-        msg = Twist()
-        msg.linear.x = 0.0
-        msg.linear.y = 0.0
-        msg.linear.z = 0.0
-        msg.angular.x = 0.0
-        msg.angular.y = 0.0
-        msg.angular.z = cmd_angular
+        # msg = Twist()
+        # msg.linear.x = 0.0
+        # msg.linear.y = 0.0
+        # msg.linear.z = 0.0
+        # msg.angular.x = 0.0
+        # msg.angular.y = 0.0
+        # msg.angular.z = cmd_angular
 
-        ros_publisher_cmd_vel.publish(msg)
-        last_cmd_angular = cmd_angular
+        # ros_publisher_cmd_vel.publish(msg)
+        # last_cmd_angular = cmd_angular
+        publish_rotate_pulse(cmd_angular)
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -292,6 +318,7 @@ def cmd_vel_timer_callback(event):
             f2,
             error,
             ALLOWABLE_ERROR,
+            cmd_angular,
             last_cmd_angular
         )
     )
