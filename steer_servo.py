@@ -36,7 +36,7 @@ REVERSE_LINEAR_SPEED = -0.4
 #
 # value2 < value3 のとき: ANGULAR_SPEED と同じ向き
 # value2 > value3 のとき: ANGULAR_SPEED と逆向き
-ANGULAR_SPEED = -0.40
+ANGULAR_SPEED = -2.4
 
 # 目標値に対する偏差の許容値
 # 例: 3なら、value2とvalue3の差が3以内なら旋回停止
@@ -50,7 +50,7 @@ ROTATE_VALUE_MAX = 254	#242
 
 # cmd_velを出す周期
 # 0.1～1.0秒程度で調整
-CMD_INTERVAL_SEC = 0.3
+CMD_INTERVAL_SEC = 0.05
 
 # 簡易サーボ制御用パラメータ
 # パルス的に「動く→止まる」を繰り返すのではなく、
@@ -58,7 +58,7 @@ CMD_INTERVAL_SEC = 0.3
 #
 # cmd_angular = error * ANGULAR_GAIN
 # ただし、MIN/MAXで制限する。
-ANGULAR_GAIN = 0.05
+ANGULAR_GAIN = 0.02
 MIN_ANGULAR_SPEED = 0.01
 MAX_ANGULAR_SPEED = abs(ANGULAR_SPEED)
 
@@ -305,7 +305,7 @@ def publish_values(value1, value2, value3):
         TOPIC_VALUE3
     )
 
-    print(text)
+#    print(text)
     sys.stdout.flush()
 
 
@@ -404,21 +404,32 @@ def cmd_vel_timer_callback(event):
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+#    print(
+#        "[{}] cmd_vel制御: value1={}, filtered_value2={:.2f}, filtered_value3={:.2f}, "
+#        "error={:.2f}, allowable_error={}, linear.x={:.3f}, angular.z={:.3f}, "
+#        "rotate_enabled={}, servo_mode=continuous"
+#        .format(
+#            now,
+#            v1,
+#            f2,
+#            f3,
+#            error,
+#            ALLOWABLE_ERROR,
+#            cmd_linear,
+#            cmd_angular,
+#            rotate_enabled
+#        )
     print(
-        "[{}] cmd_vel制御: value1={}, filtered_value2={:.2f}, filtered_value3={:.2f}, "
-        "error={:.2f}, allowable_error={}, linear.x={:.3f}, angular.z={:.3f}, "
+        "[{}] cmd_vel制御:, "
+        "error={:.2f}, angular.z={:.3f}, "
         "rotate_enabled={}, servo_mode=continuous"
         .format(
             now,
-            v1,
-            f2,
-            f3,
             error,
-            ALLOWABLE_ERROR,
-            cmd_linear,
             cmd_angular,
             rotate_enabled
         )
+
     )
     sys.stdout.flush()
 
@@ -598,9 +609,9 @@ if __name__ == "__main__":
     rospy.init_node("plc_d_register_cmd_vel_bridge", anonymous=False)
 
     # パラメータの安全チェック
-    if CMD_INTERVAL_SEC < 0.1:
-        rospy.logwarn("CMD_INTERVAL_SECが小さすぎるため0.1秒に補正します")
-        CMD_INTERVAL_SEC = 0.1
+    if CMD_INTERVAL_SEC < 0.01:
+        rospy.logwarn("CMD_INTERVAL_SECが小さすぎるため0.01秒に補正します")
+        CMD_INTERVAL_SEC = 0.01
 
     if CMD_INTERVAL_SEC > 1.0:
         rospy.logwarn("CMD_INTERVAL_SECが大きすぎるため1.0秒に補正します")
@@ -628,7 +639,7 @@ if __name__ == "__main__":
 
     if ANGULAR_GAIN <= 0.0:
         rospy.logwarn("ANGULAR_GAINが0以下のため0.03に補正します")
-        ANGULAR_GAIN = 0.03
+        ANGULAR_GAIN = 0.01
 
     if MIN_ANGULAR_SPEED < 0.0:
         MIN_ANGULAR_SPEED = 0.0
