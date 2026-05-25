@@ -1,0 +1,34 @@
+#ROS1 melodic上でcmd_velトピックにコマンドを投げるpythonコードを生成してください
+#やりたいこと
+-WebAPIで受け取った2つの値value1,value2を一致させるようにロボットを旋回させる
+-value1は現在値,value2は目標値である
+-value1,value2は正の整数で0～255の値をとる
+-旋回方向(angular)に指令を出してvalue1がvalue2と一致するまで旋回させる
+-旋回速度は一定（低速）でよい
+-加速、減速処理は不要。目標に対して偏差があれば一定速度で旋回し続けるだけ
+-現在値も目標値も値が暴れるためローパスフィルタ処理が必要（急激な変化は無視する）
+#カット＆トライするためにパラメータとして定数を定義したいものは以下の通り
+-旋回方向と旋回速度（設定範囲-6～+6 正負で旋回方向を決める）
+-目標値に対する偏差の許容値
+-旋回最小値と最大値（目標と偏差があってもそれ以下,それ以上は旋回させない）
+-旋回指令を出すインターバル（100msec～1000msecで調整可）
+#value1,value2を受け取ってROSにデータを流すのと同時に値を画面表示するコードを添付します。参考にしてください。
+
+
+添付コードは、WebAPIで value1/value2 を受け取り、/plc/d_register1 と /plc/d_register2 に Int32 でpublishする構成でした。今回は同じHTTP受信部に、ローパス処理と /cmd_vel への Twist publishを追加する形で作ります。
+
+思考時間: 11s
+
+以下は、添付いただいた plc_extra.py をベースに、WebAPIで受け取った value1/current と value2/target をローパス処理し、偏差がある間だけ /cmd_vel の angular.z に一定速度を出すコードです。添付コードでは value1/value2 を受信してROSトピックへpublishしているため、その構成を残して /cmd_vel 制御を追加しています。
+
+ポイントは以下です。
+
+value1 = 現在値
+value2 = 目標値
+abs(value2 - value1) が許容偏差以内なら停止
+偏差があれば一定速度で旋回
+value1 < value2 のときは ANGULAR_SPEED と同じ向き
+value1 > value2 のときは ANGULAR_SPEED と逆向き
+ANGULAR_SPEED の符号を変えると旋回方向を反転可能
+ローパスフィルタで急変をなだらかにする
+ROTATE_VALUE_MIN/MAX の外では旋回させない
