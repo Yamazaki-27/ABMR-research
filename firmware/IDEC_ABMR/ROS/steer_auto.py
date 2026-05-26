@@ -18,12 +18,8 @@ except ImportError:
 # ここ数値を変更して run_docker.sh を再実行してください
 # ============================================================
 
-# Start座標からEnd座標に向かうための設定
-END_X = -1.28     # End座標 X (m)
-END_Y = 0.6  #0.27      # End座標 Y (m)
-
-# 旋回制御用の定数
-ANGULAR_SPEED = 1.5      # 最大旋回速度 (絶対値)
+TARGET_VALUE_A = 50
+ANGULAR_SPEED = 1.5
 ANGULAR_GAIN = 0.02
 ALLOWABLE_ERROR = 4
 ROTATE_VALUE_MIN = 1
@@ -32,23 +28,21 @@ MIN_ANGULAR_SPEED = 0.05
 CMD_INTERVAL_SEC = 0.1
 HTTP_PORT = 5001
 
-# Step2, Step3用パラメータ (今回はStep1までですが、構成として残しておきます)
-LINEAR_SPEED = -0.2
-TARGET_DISTANCE = 1.9
-TARGET_VALUE_STRAIGHT = 120
-STRAIGHT_DISTANCE = 1.0
+# Step2用追加パラメータ
+LINEAR_SPEED = -0.2      # Step2, Step3での直進方向速度
+TARGET_DISTANCE = 2.0    # Step2で移動する距離(m)
 
-# プログラムで自動決定される目標値
-TARGET_VALUE_A = None
+# Step3用追加パラメータ
+TARGET_VALUE_STRAIGHT = 120 # Step3での直進方向となるvalue2の目標値
+STRAIGHT_DISTANCE = 0.8     # Step3で直進状態のまま維持する移動距離(m)
 
 def load_params():
-    global END_X, END_Y, ANGULAR_SPEED, ANGULAR_GAIN, ALLOWABLE_ERROR
+    global TARGET_VALUE_A, ANGULAR_SPEED, ANGULAR_GAIN, ALLOWABLE_ERROR
     global ROTATE_VALUE_MIN, ROTATE_VALUE_MAX, MIN_ANGULAR_SPEED
     global CMD_INTERVAL_SEC, HTTP_PORT, LINEAR_SPEED, TARGET_DISTANCE
     global TARGET_VALUE_STRAIGHT, STRAIGHT_DISTANCE
     
-    END_X = rospy.get_param('~end_x', END_X)
-    END_Y = rospy.get_param('~end_y', END_Y)
+    TARGET_VALUE_A = rospy.get_param('~target_value', TARGET_VALUE_A)
     ANGULAR_SPEED = rospy.get_param('~angular_speed', ANGULAR_SPEED)
     ANGULAR_GAIN = rospy.get_param('~angular_gain', ANGULAR_GAIN)
     ALLOWABLE_ERROR = rospy.get_param('~allowable_error', ALLOWABLE_ERROR)
@@ -57,6 +51,10 @@ def load_params():
     MIN_ANGULAR_SPEED = rospy.get_param('~min_angular_speed', MIN_ANGULAR_SPEED)
     CMD_INTERVAL_SEC = rospy.get_param('~cmd_interval_sec', CMD_INTERVAL_SEC)
     HTTP_PORT = rospy.get_param('~http_port', HTTP_PORT)
+    LINEAR_SPEED = rospy.get_param('~linear_speed', LINEAR_SPEED)
+    TARGET_DISTANCE = rospy.get_param('~target_distance', TARGET_DISTANCE)
+    TARGET_VALUE_STRAIGHT = rospy.get_param('~target_value_straight', TARGET_VALUE_STRAIGHT)
+    STRAIGHT_DISTANCE = rospy.get_param('~straight_distance', STRAIGHT_DISTANCE)
 
 # ============================================================
 
@@ -64,24 +62,13 @@ def load_params():
 latest_value2 = None
 lock = threading.Lock()
 
-current_state = 'STEP0' # odom受信および旋回方向計算待ち状態
-
-start_x = None
-start_y = None
-start_yaw = None
-
+current_state = 'STEP1'
 accumulated_distance = 0.0
 prev_x = None
 prev_y = None
 
 def clamp(value, min_val, max_val):
     return max(min_val, min(value, max_val))
-
-def euler_from_quaternion(x, y, z, w):
-    # クォータニオンからYaw角(Z軸周りの回転)を算出
-    t3 = +2.0 * (w * z + x * y)
-    t4 = +1.0 - 2.0 * (y * y + z * z)
-    return math.atan2(t3, t4)
 
 class WebAPIHandler(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -127,21 +114,13 @@ class WebAPIHandler(BaseHTTPRequestHandler):
 
 def odom_callback(msg):
     global prev_x, prev_y, accumulated_distance
-    global start_x, start_y, start_yaw
     
     with lock:
-        curr_x = msg.pose.pose.position.x
-        curr_y = msg.pose.pose.position.y
-        
-        # 初回受信時にStart座標として記録
-        if start_x is None:
-            start_x = curr_x
-            start_y = curr_y
-            q = msg.pose.pose.orientation
-            start_yaw = euler_from_quaternion(q.x, q.y, q.z, q.w)
-        
-        # 以降のステップ用距離計測 (今回はStep1で終了しますが機能は残します)
+        # STEP2 と STEP3 の両方で距離を計測する
         if current_state in ['STEP2', 'STEP3']:
+            curr_x = msg.pose.pose.position.x
+            curr_y = msg.pose.pose.position.y
+            
             if prev_x is not None and prev_y is not None:
                 dx = curr_x - prev_x
                 dy = curr_y - prev_y
@@ -152,7 +131,6 @@ def odom_callback(msg):
 
 def cmd_vel_loop():
     global current_state, accumulated_distance, prev_x, prev_y
-    global TARGET_VALUE_A
     
     ros_publisher = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
     rospy.Subscriber('/odom', Odometry, odom_callback)
@@ -165,9 +143,6 @@ def cmd_vel_loop():
             val2 = latest_value2
             state = current_state
             current_dist = accumulated_distance
-            sx = start_x
-            sy = start_y
-            syaw = start_yaw
             
         msg = Twist()
         msg.linear.y = 0.0
@@ -177,71 +152,13 @@ def cmd_vel_loop():
         msg.linear.x = 0.0
         msg.angular.z = 0.0
         
-        if state == 'STEP0':
-            # odomからの初期位置受信待ち ＆ 旋回方向の決定
-            if sx is not None and sy is not None and syaw is not None:
-                dx_to_end = END_X - sx
-                dy_to_end = END_Y - sy
-
-                # ロボットの前進方向ベクトル (odom座標系)
-                fwd_x = math.cos(syaw)
-                fwd_y = math.sin(syaw)
-
-                # Endへの方向角度 (odom座標系)
-                angle_to_end = math.atan2(dy_to_end, dx_to_end)
-
-                # -------------------------------------------------------
-                # ロボット座標系でのEnd位置を計算
-                #   local_x = 前方成分 (正=前方)
-                #   local_y = 側方成分 (標準右手系では正=左, 負=右)
-                # -------------------------------------------------------
-                local_x = fwd_x * dx_to_end + fwd_y * dy_to_end
-                local_y = -fwd_y * dx_to_end + fwd_x * dy_to_end
-
-                # -------------------------------------------------------
-                # 旋回方向の判定
-                # ★重要★ local_y の符号と 90/150 の対応関係は
-                # 実機動作で確認が必要。想定通りでなければ下記を変更:
-                #   TURN_SIGN = +1  → local_y > 0 のとき value2=90
-                #   TURN_SIGN = -1  → local_y > 0 のとき value2=150
-                # -------------------------------------------------------
-                TURN_SIGN = 1   # +1 or -1 で旋回方向を反転できます
-
-                if local_y * TURN_SIGN > 0:
-                    TARGET_VALUE_A = 90
-                    direction_str = "local_y * TURN_SIGN > 0 -> value2=90"
-                else:
-                    TARGET_VALUE_A = 150
-                    direction_str = "local_y * TURN_SIGN <= 0 -> value2=150"
-
-                rospy.loginfo("--- Direction Initialization ---")
-                rospy.loginfo("Start         : pos(%.3f, %.3f), yaw=%.3f rad (%.1f deg)",
-                              sx, sy, syaw, math.degrees(syaw))
-                rospy.loginfo("End           : pos(%.3f, %.3f)", END_X, END_Y)
-                rospy.loginfo("Vector to End : dx=%.3f  dy=%.3f", dx_to_end, dy_to_end)
-                rospy.loginfo("angle_to_end  : %.3f rad (%.1f deg)",
-                              angle_to_end, math.degrees(angle_to_end))
-                rospy.loginfo("Robot local frame:")
-                rospy.loginfo("  local_x (forward) = %.4f  (+ = ahead, - = behind)", local_x)
-                rospy.loginfo("  local_y (lateral) = %.4f  (standard: + = left, - = right)", local_y)
-                rospy.loginfo("TURN_SIGN=%d  ->  local_y*TURN_SIGN = %.4f", TURN_SIGN, local_y * TURN_SIGN)
-                rospy.loginfo("Decision      : %s", direction_str)
-                rospy.loginfo("TARGET_VALUE_A set to: %d", TARGET_VALUE_A)
-                rospy.loginfo("--------------------------------")
-                
-                with lock:
-                    current_state = 'STEP1'
-                    state = 'STEP1'
-            else:
-                rospy.loginfo_throttle(2.0, "Debug - State: STEP0, waiting for /odom...")
-                
-        elif state == 'STOP':
+        if state == 'STOP':
             # 停止状態
             msg.linear.x = 0.0
             msg.angular.z = 0.0
-            rospy.loginfo_throttle(2.0, "Debug - State: STOP, Task completed.")
+            rospy.loginfo_throttle(2.0, "Debug - State: STOP, Waiting... Distance covered in last step: %.3f m", current_dist)
             
-        elif val2 is not None and TARGET_VALUE_A is not None:
+        elif val2 is not None:
             # 安全範囲外の場合は強制停止
             if val2 < ROTATE_VALUE_MIN or val2 > ROTATE_VALUE_MAX:
                 rospy.logwarn_throttle(2.0, "value2 (%d) is out of safe range [%d, %d]. Stopping.", 
@@ -249,7 +166,7 @@ def cmd_vel_loop():
                 msg.angular.z = 0.0
                 msg.linear.x = 0.0
             else:
-                # 状態に応じて目標値を切り替え（今回はStep1のみ使用）
+                # 状態に応じて目標値を切り替え
                 current_target = TARGET_VALUE_A if state in ['STEP1', 'STEP2'] else TARGET_VALUE_STRAIGHT
                 diff = val2 - current_target
                 
@@ -257,33 +174,58 @@ def cmd_vel_loop():
                 if abs(diff) <= ALLOWABLE_ERROR:
                     msg.angular.z = 0.0
                     
-                    # 状態遷移 (今回はSTEP1完了後にSTOPへ遷移して終了)
+                    # 状態遷移 (STEP1 -> STEP2)
                     if state == 'STEP1':
-                        rospy.loginfo("Target angle (%d) reached! Transitioning to STOP (as requested for this test).", TARGET_VALUE_A)
+                        rospy.loginfo("Target angle reached! Transitioning to STEP2.")
                         with lock:
-                            current_state = 'STOP'
-                            state = 'STOP'
+                            current_state = 'STEP2'
+                            state = 'STEP2'
+                            accumulated_distance = 0.0
+                            prev_x = None
+                            prev_y = None
                 else:
                     # 比例制御
                     calc_speed = abs(diff) * ANGULAR_GAIN
                     max_speed = abs(ANGULAR_SPEED)
                     calc_speed = clamp(calc_speed, MIN_ANGULAR_SPEED, max_speed)
                     
-                    # ANGULAR_SPEEDの符号でモーターの回転方向（プラスマイナス）の反転に対応
                     base_direction = 1.0 if ANGULAR_SPEED >= 0 else -1.0
-                    
                     if current_target < val2:
                         msg.angular.z = calc_speed * base_direction
                     else:
                         msg.angular.z = calc_speed * (-base_direction)
                 
-                # 直進速度 (Step1中は0)
+                # 直進速度と距離に基づく状態遷移
                 if state == 'STEP1':
                     msg.linear.x = 0.0
+                elif state == 'STEP2':
+                    msg.linear.x = LINEAR_SPEED
+                    
+                    # 停止判定 (STEP2 -> STEP3)
+                    if current_dist >= TARGET_DISTANCE:
+                        rospy.loginfo("Target distance (%.3f m) reached! Transitioning to STEP3.", TARGET_DISTANCE)
+                        with lock:
+                            current_state = 'STEP3'
+                            state = 'STEP3'
+                            accumulated_distance = 0.0  # Step3用の距離計測としてリセット
+                            current_dist = 0.0
+                            prev_x = None
+                            prev_y = None
+                elif state == 'STEP3':
+                    msg.linear.x = LINEAR_SPEED
+                    
+                    # 停止判定 (STEP3 -> STOP)
+                    if current_dist >= STRAIGHT_DISTANCE:
+                        rospy.loginfo("Straight distance (%.3f m) reached! Transitioning to STOP.", STRAIGHT_DISTANCE)
+                        with lock:
+                            current_state = 'STOP'
+                            state = 'STOP'
+                        msg.linear.x = 0.0
+                        msg.angular.z = 0.0
 
-            if state != 'STOP':
-                rospy.loginfo("Debug - State: %s, value2: %d, Target: %d, cmd_z: %.3f", 
-                              state, val2, current_target, msg.angular.z)
+            rospy.loginfo("Debug - State: %s, value2: %s, Target: %d, cmd_x: %.2f, cmd_z: %.3f, Dist: %.3fm", 
+                          state, str(val2), current_target if val2 is not None and state != 'STOP' else 0, 
+                          msg.linear.x, msg.angular.z, current_dist)
         else:
             # val2 が未受信の場合
             msg.linear.x = 0.0
@@ -303,8 +245,12 @@ def main():
     server_thread.start()
     
     rospy.loginfo("Web API Server started on port %d", HTTP_PORT)
-    rospy.loginfo("END_X = %.2f, END_Y = %.2f", END_X, END_Y)
-    rospy.loginfo("ANGULAR_SPEED (Max speed) = %.2f", ANGULAR_SPEED)
+    rospy.loginfo("TARGET_VALUE_A = %d", TARGET_VALUE_A)
+    rospy.loginfo("TARGET_VALUE_STRAIGHT = %d", TARGET_VALUE_STRAIGHT)
+    rospy.loginfo("ANGULAR_SPEED = %.2f", ANGULAR_SPEED)
+    rospy.loginfo("LINEAR_SPEED = %.2f", LINEAR_SPEED)
+    rospy.loginfo("TARGET_DISTANCE = %.2f", TARGET_DISTANCE)
+    rospy.loginfo("STRAIGHT_DISTANCE = %.2f", STRAIGHT_DISTANCE)
     
     try:
         cmd_vel_loop()
