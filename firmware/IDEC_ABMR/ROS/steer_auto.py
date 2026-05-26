@@ -5,8 +5,7 @@ import json
 import threading
 import math
 import rospy
-from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist, Pose
 
 try:
     from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -20,7 +19,7 @@ except ImportError:
 
 # Start座標からEnd座標に向かうための設定
 END_X = -1.28     # End座標 X (m)
-END_Y = 0.6  #0.27      # End座標 Y (m)
+END_Y = 0.20      # End座標 Y (m)
 
 # 旋回制御用の定数
 ANGULAR_SPEED = 1.5      # 最大旋回速度 (絶対値)
@@ -32,11 +31,16 @@ MIN_ANGULAR_SPEED = 0.05
 CMD_INTERVAL_SEC = 0.1
 HTTP_PORT = 5001
 
-# Step2, Step3用パラメータ (今回はStep1までですが、構成として残しておきます)
-LINEAR_SPEED = -0.2
-TARGET_DISTANCE = 1.9
-TARGET_VALUE_STRAIGHT = 120
-STRAIGHT_DISTANCE = 1.0
+# Step1 ドライブユニット目標値 (後で調整可能)
+# ★ ここを変更してカット＆トライしてください ★
+TARGET_VALUE_RIGHT    = 50    # 右旋回時のドライブユニット目標値 (常に50の固定値)
+TARGET_VALUE_STRAIGHT = 120   # 直進時のドライブユニット目標値 (常に120の固定値)
+TARGET_VALUE_LEFT     = 190   # 左旋回時のドライブユニット目標値 (常に190の固定値)
+
+# Step2, Step3用パラメータ
+LINEAR_SPEED   = -0.2   # 走行速度 (負=後退)
+STEP2_DISTANCE = 2.0    # STEP2（円弧走行）の固定移動距離 (m) ★調整可★
+# STEP3の移動距離はSTEP2完了時の座標からEndまでの残り距離を自動算出
 
 # プログラムで自動決定される目標値
 TARGET_VALUE_A = None
@@ -44,8 +48,9 @@ TARGET_VALUE_A = None
 def load_params():
     global END_X, END_Y, ANGULAR_SPEED, ANGULAR_GAIN, ALLOWABLE_ERROR
     global ROTATE_VALUE_MIN, ROTATE_VALUE_MAX, MIN_ANGULAR_SPEED
-    global CMD_INTERVAL_SEC, HTTP_PORT, LINEAR_SPEED, TARGET_DISTANCE
-    global TARGET_VALUE_STRAIGHT, STRAIGHT_DISTANCE
+    global CMD_INTERVAL_SEC, HTTP_PORT, LINEAR_SPEED, STEP2_DISTANCE
+    global TARGET_VALUE_STRAIGHT
+    global TARGET_VALUE_RIGHT, TARGET_VALUE_LEFT
     
     END_X = rospy.get_param('~end_x', END_X)
     END_Y = rospy.get_param('~end_y', END_Y)
@@ -57,6 +62,11 @@ def load_params():
     MIN_ANGULAR_SPEED = rospy.get_param('~min_angular_speed', MIN_ANGULAR_SPEED)
     CMD_INTERVAL_SEC = rospy.get_param('~cmd_interval_sec', CMD_INTERVAL_SEC)
     HTTP_PORT = rospy.get_param('~http_port', HTTP_PORT)
+    LINEAR_SPEED = rospy.get_param('~linear_speed', LINEAR_SPEED)
+    STEP2_DISTANCE = rospy.get_param('~step2_distance', STEP2_DISTANCE)
+    TARGET_VALUE_STRAIGHT = rospy.get_param('~target_value_straight', TARGET_VALUE_STRAIGHT)
+    TARGET_VALUE_RIGHT = rospy.get_param('~target_value_right', TARGET_VALUE_RIGHT)
+    TARGET_VALUE_LEFT = rospy.get_param('~target_value_left', TARGET_VALUE_LEFT)
 
 # ============================================================
 
@@ -73,6 +83,10 @@ start_yaw = None
 accumulated_distance = 0.0
 prev_x = None
 prev_y = None
+
+step3_target_distance = None  # STEP3の走行目標距離（STEP2完了時に自動算出）
+current_robot_x = None        # 最新ロボット位置X（全ステップで随時更新）
+current_robot_y = None        # 最新ロボット位置Y（全ステップで随時更新）
 
 def clamp(value, min_val, max_val):
     return max(min_val, min(value, max_val))
@@ -125,37 +139,50 @@ class WebAPIHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-def odom_callback(msg):
+def robot_pose_callback(msg):
+    """絶対座標トピック /atmobi/robot_pose (geometry_msgs/Pose) のコールバック。
+    メッセージ型が PoseStamped の場合は msg.pose.position / msg.pose.orientation に変更してください。
+    """
     global prev_x, prev_y, accumulated_distance
     global start_x, start_y, start_yaw
-    
+    global current_robot_x, current_robot_y
+
     with lock:
-        curr_x = msg.pose.pose.position.x
-        curr_y = msg.pose.pose.position.y
-        
-        # 初回受信時にStart座標として記録
+        curr_x = msg.position.x
+        curr_y = msg.position.y
+        q = msg.orientation
+        curr_yaw = euler_from_quaternion(q.x, q.y, q.z, q.w)
+
+        # 常に最新のロボット位置を保持（STEP3距離算出などに使用）
+        current_robot_x = curr_x
+        current_robot_y = curr_y
+
+        # 初回受信時にStart座標として記録 (絶対座標のため毎回同じ原点を使える)
         if start_x is None:
             start_x = curr_x
             start_y = curr_y
-            q = msg.pose.pose.orientation
-            start_yaw = euler_from_quaternion(q.x, q.y, q.z, q.w)
-        
-        # 以降のステップ用距離計測 (今回はStep1で終了しますが機能は残します)
+            start_yaw = curr_yaw
+            rospy.loginfo("robot_pose received: Start pos(%.3f, %.3f), yaw=%.3f rad (%.1f deg)",
+                          curr_x, curr_y, curr_yaw, math.degrees(curr_yaw))
+
+        # 以降のステップ用距離計測
         if current_state in ['STEP2', 'STEP3']:
             if prev_x is not None and prev_y is not None:
                 dx = curr_x - prev_x
                 dy = curr_y - prev_y
                 accumulated_distance += math.sqrt(dx**2 + dy**2)
-            
+
             prev_x = curr_x
             prev_y = curr_y
 
 def cmd_vel_loop():
     global current_state, accumulated_distance, prev_x, prev_y
     global TARGET_VALUE_A
+    global TARGET_VALUE_RIGHT, TARGET_VALUE_LEFT, TARGET_VALUE_STRAIGHT
+    global step3_target_distance
     
     ros_publisher = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
-    rospy.Subscriber('/odom', Odometry, odom_callback)
+    rospy.Subscriber('/atmobi/robot_pose', Pose, robot_pose_callback)
     rate = rospy.Rate(1.0 / CMD_INTERVAL_SEC)
     
     rospy.loginfo("Start publishing cmd_vel every %.3f sec", CMD_INTERVAL_SEC)
@@ -168,6 +195,8 @@ def cmd_vel_loop():
             sx = start_x
             sy = start_y
             syaw = start_yaw
+            crx = current_robot_x
+            cry = current_robot_y
             
         msg = Twist()
         msg.linear.y = 0.0
@@ -200,19 +229,18 @@ def cmd_vel_loop():
 
                 # -------------------------------------------------------
                 # 旋回方向の判定
-                # ★重要★ local_y の符号と 90/150 の対応関係は
-                # 実機動作で確認が必要。想定通りでなければ下記を変更:
-                #   TURN_SIGN = +1  → local_y > 0 のとき value2=90
-                #   TURN_SIGN = -1  → local_y > 0 のとき value2=150
+                # ★重要★ local_y の符号と 右旋回/左旋回 の対応関係:
+                #   TURN_SIGN = +1  → local_y > 0 のとき 右旋回 (TARGET_VALUE_RIGHT=50)
+                #   TURN_SIGN = -1  → local_y > 0 のとき 左旋回 (TARGET_VALUE_LEFT=190)
                 # -------------------------------------------------------
                 TURN_SIGN = 1   # +1 or -1 で旋回方向を反転できます
 
                 if local_y * TURN_SIGN > 0:
-                    TARGET_VALUE_A = 90
-                    direction_str = "local_y * TURN_SIGN > 0 -> value2=90"
+                    TARGET_VALUE_A = TARGET_VALUE_RIGHT   # 右旋回: 固定値50
+                    direction_str = "local_y * TURN_SIGN > 0 -> Right Turn (右旋回) -> target=%d" % TARGET_VALUE_RIGHT
                 else:
-                    TARGET_VALUE_A = 150
-                    direction_str = "local_y * TURN_SIGN <= 0 -> value2=150"
+                    TARGET_VALUE_A = TARGET_VALUE_LEFT    # 左旋回: 固定値190
+                    direction_str = "local_y * TURN_SIGN <= 0 -> Left Turn (左旋回) -> target=%d" % TARGET_VALUE_LEFT
 
                 rospy.loginfo("--- Direction Initialization ---")
                 rospy.loginfo("Start         : pos(%.3f, %.3f), yaw=%.3f rad (%.1f deg)",
@@ -227,8 +255,14 @@ def cmd_vel_loop():
                 rospy.loginfo("TURN_SIGN=%d  ->  local_y*TURN_SIGN = %.4f", TURN_SIGN, local_y * TURN_SIGN)
                 rospy.loginfo("Decision      : %s", direction_str)
                 rospy.loginfo("TARGET_VALUE_A set to: %d", TARGET_VALUE_A)
+
+                # Start→Endのユークリッド直線距離（参考値）
+                total_distance = math.sqrt(dx_to_end**2 + dy_to_end**2)
+                rospy.loginfo("Start->End 直線距離 (参考) = %.3f m", total_distance)
+                rospy.loginfo("  STEP2 (円弧走行) : 固定 %.3f m", STEP2_DISTANCE)
+                rospy.loginfo("  STEP3 (直進走行) : STEP2完了時の座標からEndまでの残り距離を自動算出")
                 rospy.loginfo("--------------------------------")
-                
+
                 with lock:
                     current_state = 'STEP1'
                     state = 'STEP1'
@@ -253,37 +287,88 @@ def cmd_vel_loop():
                 current_target = TARGET_VALUE_A if state in ['STEP1', 'STEP2'] else TARGET_VALUE_STRAIGHT
                 diff = val2 - current_target
                 
-                # 角速度の計算
-                if abs(diff) <= ALLOWABLE_ERROR:
-                    msg.angular.z = 0.0
-                    
-                    # 状態遷移 (今回はSTEP1完了後にSTOPへ遷移して終了)
-                    if state == 'STEP1':
-                        rospy.loginfo("Target angle (%d) reached! Transitioning to STOP (as requested for this test).", TARGET_VALUE_A)
+                # -------------------------------------------------------
+                # 状態遷移（距離・角度に基づく）
+                # -------------------------------------------------------
+                if state == 'STEP1':
+                    # ドライブユニットが目標角度に到達 → STEP2へ
+                    if abs(diff) <= ALLOWABLE_ERROR:
+                        rospy.loginfo("STEP1完了: ドライブユニット %d に到達。STEP2（カーブ走行）へ移行。", TARGET_VALUE_A)
+                        with lock:
+                            accumulated_distance = 0.0
+                            prev_x = None
+                            prev_y = None
+                            current_state = 'STEP2'
+                            state = 'STEP2'
+
+                elif state == 'STEP2':
+                    # 固定距離(STEP2_DISTANCE)の円弧走行完了 → STEP3へ
+                    if current_dist >= STEP2_DISTANCE:
+                        # STEP3の走行距離 = 現在位置からEndまでの残り距離を算出
+                        if crx is not None and cry is not None:
+                            dx_s3 = END_X - crx
+                            dy_s3 = END_Y - cry
+                            s3_dist = math.sqrt(dx_s3**2 + dy_s3**2) # + 0.1 実際の座標に対しては＋0.1が良さそう
+                        else:
+                            s3_dist = 1.0  # フォールバック（現在位置不明時）
+                        rospy.loginfo("STEP2完了: %.3f m 移動（円弧）。STEP3（直進走行）へ移行。", current_dist)
+                        rospy.loginfo("  現在位置: (%.3f, %.3f) -> End: (%.3f, %.3f)  残り %.3f m",
+                                      crx if crx is not None else 0.0,
+                                      cry if cry is not None else 0.0,
+                                      END_X, END_Y, s3_dist)
+                        with lock:
+                            step3_target_distance = s3_dist
+                            accumulated_distance = 0.0
+                            current_state = 'STEP3'
+                            state = 'STEP3'
+
+                elif state == 'STEP3':
+                    # STEP2完了時に算出した残り距離に達したら停止
+                    s3_target = step3_target_distance if step3_target_distance is not None else 1.0
+                    if current_dist >= s3_target:
+                        rospy.loginfo("STEP3完了: %.3f m / %.3f m 移動。停止します。", current_dist, s3_target)
                         with lock:
                             current_state = 'STOP'
                             state = 'STOP'
+
+                # -------------------------------------------------------
+                # 角速度の計算（比例制御）
+                # -------------------------------------------------------
+                if abs(diff) <= ALLOWABLE_ERROR:
+                    msg.angular.z = 0.0
                 else:
-                    # 比例制御
                     calc_speed = abs(diff) * ANGULAR_GAIN
                     max_speed = abs(ANGULAR_SPEED)
                     calc_speed = clamp(calc_speed, MIN_ANGULAR_SPEED, max_speed)
-                    
-                    # ANGULAR_SPEEDの符号でモーターの回転方向（プラスマイナス）の反転に対応
+
+                    # ANGULAR_SPEEDの符号でモーター回転方向を調整
                     base_direction = 1.0 if ANGULAR_SPEED >= 0 else -1.0
-                    
+
                     if current_target < val2:
                         msg.angular.z = calc_speed * base_direction
                     else:
                         msg.angular.z = calc_speed * (-base_direction)
-                
-                # 直進速度 (Step1中は0)
-                if state == 'STEP1':
-                    msg.linear.x = 0.0
+
+                # -------------------------------------------------------
+                # 直進速度の設定
+                #   STEP1: 停止（ドライブユニット回転のみ）
+                #   STEP2/3: LINEAR_SPEED で走行
+                # -------------------------------------------------------
+                if state in ['STEP2', 'STEP3']:
+                    msg.linear.x = LINEAR_SPEED
+                # STEP1 は msg.linear.x = 0.0 (ループ先頭で初期化済み)
 
             if state != 'STOP':
-                rospy.loginfo("Debug - State: %s, value2: %d, Target: %d, cmd_z: %.3f", 
-                              state, val2, current_target, msg.angular.z)
+                if state == 'STEP2':
+                    dist_limit_log = STEP2_DISTANCE
+                elif state == 'STEP3':
+                    dist_limit_log = step3_target_distance if step3_target_distance is not None else 0.0
+                else:
+                    dist_limit_log = 0.0
+                rospy.loginfo_throttle(1.0,
+                    "State: %s | value2: %d -> target: %d (diff: %+d) | dist: %.3f/%.3f m | linear: %.2f cmd_z: %.3f",
+                    state, val2, current_target, diff, current_dist, dist_limit_log,
+                    msg.linear.x, msg.angular.z)
         else:
             # val2 が未受信の場合
             msg.linear.x = 0.0
@@ -305,6 +390,11 @@ def main():
     rospy.loginfo("Web API Server started on port %d", HTTP_PORT)
     rospy.loginfo("END_X = %.2f, END_Y = %.2f", END_X, END_Y)
     rospy.loginfo("ANGULAR_SPEED (Max speed) = %.2f", ANGULAR_SPEED)
+    rospy.loginfo("--- Drive Unit Target Values (Fixed) ---")
+    rospy.loginfo("  TARGET_VALUE_RIGHT    = %d  (右旋回時)", TARGET_VALUE_RIGHT)
+    rospy.loginfo("  TARGET_VALUE_STRAIGHT = %d  (直進時 / STEP3)", TARGET_VALUE_STRAIGHT)
+    rospy.loginfo("  TARGET_VALUE_LEFT     = %d  (左旋回時)", TARGET_VALUE_LEFT)
+    rospy.loginfo("----------------------------------------")
     
     try:
         cmd_vel_loop()
