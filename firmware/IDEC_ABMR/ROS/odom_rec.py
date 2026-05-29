@@ -73,19 +73,32 @@ class RequestHandler(BaseHTTPRequestHandler):
                     except ValueError:
                         saved_data = []
 
-            new_record = {
-                "waypoint": waypoint_num,
-                "x": x,
-                "y": y
-            }
-            saved_data.append(new_record)
+            # --- 【修正ロジック】既存の経由点があるか検索し、あれば上書き、なければ追加 ---
+            updated = False
+            for record in saved_data:
+                if record.get("waypoint") == waypoint_num:
+                    record["x"] = x
+                    record["y"] = y
+                    updated = True
+                    break
+            
+            if not updated:
+                saved_data.append({
+                    "waypoint": waypoint_num,
+                    "x": x,
+                    "y": y
+                })
+            # -----------------------------------------------------------------
 
             with open(FILE_PATH, 'w') as f:
                 json.dump(saved_data, f, indent=4)
 
             rospy.loginfo("Saved Waypoint: %s, X: %.3f, Y: %.3f", waypoint_num, x, y)
 
-            response_body = json.dumps({"status": "success", "data": new_record})
+            # APIのレスポンスデータを作成
+            response_record = {"waypoint": waypoint_num, "x": x, "y": y}
+            response_body = json.dumps({"status": "success", "data": response_record})
+            
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.send_header('Content-length', str(len(response_body)))
